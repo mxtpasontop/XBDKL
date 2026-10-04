@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["crates/xbdm", "crates/xbdk", "crates/xbdk-gui"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"

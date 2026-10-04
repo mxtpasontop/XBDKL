@@ -1,0 +1,16 @@
+[package]
+name = "xbdk"
+description = "Xbox 360 Neighborhood for Linux (command line)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xbdm = { path = "../xbdm" }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+png = "0.18.1"
+fuser = "0.18.0"
+libc = "0.2.190"
+tempfile = "3.27.0"
+ctrlc = "3.5.2"

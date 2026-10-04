@@ -1,0 +1,11 @@
+[package]
+name = "xbdk-gui"
+description = "Xbox 360 Neighborhood for Linux (graphical)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe = "0.36.2"
+png = "0.18.1"
+xbdm = { path = "../xbdm" }

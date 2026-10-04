@@ -1,0 +1,9 @@
+[package]
+name = "xbdm"
+description = "Client for the Xbox 360 debug monitor (XBDM) protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"
