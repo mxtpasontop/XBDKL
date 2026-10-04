@@ -1,6 +1,7 @@
 //! `xbdk`: Xbox 360 Neighborhood for the Linux command line.
 
 mod debug;
+mod extra;
 mod fuse;
 
 use std::fs::File;
@@ -17,7 +18,7 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Parser)]
 #[command(version, about = "Xbox 360 Neighborhood for Linux")]
-struct Cli {
+pub(crate) struct Cli {
     /// Console IP address or debug name. If omitted, the only console on the network is used.
     #[arg(short, long, env = "XBDK_CONSOLE", global = true)]
     console: Option<String>,
@@ -97,6 +98,22 @@ enum Command {
     /// Threads, registers, execution control, breakpoints and events.
     #[command(subcommand)]
     Debug(debug::DebugCmd),
+    /// List installed games, saves and DLC with their names.
+    Games {
+        /// Also show titles that only have saves or other content.
+        #[arg(short, long)]
+        all: bool,
+        /// List every package.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Copy only new and changed files between a console folder and a local folder.
+    #[command(subcommand)]
+    Sync(extra::SyncCmd),
+    /// Interactive shell (cd, ls, get, put, mem, find, ...).
+    Shell,
+    /// Print a shell completion script, e.g. `xbdk completions bash > ~/.local/share/bash-completion/completions/xbdk`.
+    Completions { shell: clap_complete::Shell },
     /// Launch an executable (.xex).
     Launch { xex: String },
     /// Reboot to the dashboard.
@@ -114,18 +131,27 @@ fn main() -> Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
-    if let Command::Discover = cli.command {
-        return discover();
+    match &cli.command {
+        Command::Discover => return discover(),
+        Command::Completions { shell } => {
+            extra::completions(*shell);
+            return Ok(());
+        }
+        _ => {}
     }
 
     let target = find_console(cli.console.as_deref())?;
-    if let Command::Mount { mountpoint, read_only } = &cli.command {
-        return fuse::mount(target, mountpoint, *read_only);
+    match &cli.command {
+        Command::Mount { mountpoint, read_only } => return fuse::mount(target, mountpoint, *read_only),
+        Command::Shell => return extra::shell(target),
+        _ => {}
     }
     let mut xbox = Client::connect(target).with_context(|| format!("connecting to {target}"))?;
 
     match cli.command {
-        Command::Discover | Command::Mount { .. } => unreachable!(),
+        Command::Discover | Command::Mount { .. } | Command::Shell | Command::Completions { .. } => unreachable!(),
+        Command::Games { all, verbose } => extra::games(&mut xbox, all, verbose)?,
+        Command::Sync(cmd) => extra::sync(&mut xbox, cmd)?,
         Command::Modules { sections } => return debug::run_modules(xbox, sections),
         Command::Mem(cmd) => return debug::run_mem(xbox, cmd),
         Command::Debug(cmd) => return debug::run_debug(xbox, cmd),
@@ -247,11 +273,11 @@ fn show_title(xbox: &mut Client) -> Result<()> {
 }
 
 /// Progress callbacks for copies: one line per file.
-fn print_get(remote: &str, local: &std::path::Path, bytes: u64) {
+pub(crate) fn print_get(remote: &str, local: &std::path::Path, bytes: u64) {
     println!("{remote} -> {} ({})", local.display(), human_size(bytes));
 }
 
-fn print_put(remote: &str, local: &std::path::Path, bytes: u64) {
+pub(crate) fn print_put(remote: &str, local: &std::path::Path, bytes: u64) {
     println!("{} -> {remote} ({})", local.display(), human_size(bytes));
 }
 
@@ -288,41 +314,4 @@ fn find_console(spec: Option<&str>) -> Result<SocketAddr> {
     }
 }
 
-pub(crate) fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
-}
-
-/// Formats a timestamp as `YYYY-MM-DD HH:MM` (UTC).
-fn format_time(t: Option<SystemTime>) -> String {
-    match t {
-        Some(t) if t >= UNIX_EPOCH => {
-            let (y, mo, d, h, mi, _) = civil_time(t);
-            format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
-        }
-        _ => " ".repeat(16),
-    }
-}
-
-/// Splits a time into UTC (year, month, day, hour, minute, second).
-fn civil_time(t: SystemTime) -> (i64, i64, i64, u64, u64, u64) {
-    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let (days, rem) = (secs / 86_400, secs % 86_400);
-    // Civil-from-days (Howard Hinnant), valid for dates after 1970.
-    let z = days as i64 + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day, rem / 3600, rem % 3600 / 60, rem % 60)
-}
+pub(crate) use xbdm::display::{civil_time, format_time, human_size};

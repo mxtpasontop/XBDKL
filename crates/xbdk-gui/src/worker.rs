@@ -9,9 +9,11 @@ use std::thread;
 use std::time::Duration;
 
 use eframe::egui;
+use xbdm::content::{self, Library, NameCache};
+use xbdm::shell::Shell;
 use xbdm::title::RunningTitle;
 use xbdm::{
-    transfer, Client, Console, Context, DirEntry, FreeSpace, Notification, Screenshot, ThreadInfo, XBDM_PORT,
+    transfer, Client, Console, Context, DirEntry, FreeSpace, Notification, Pattern, Screenshot, ThreadInfo, XBDM_PORT,
 };
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -35,10 +37,20 @@ pub enum Job {
     Registers(u32),
     Stop,
     Go,
-    Breakpoint { addr: u32, set: bool },
+    /// Address expressions: hex, `module`, or `module+offset`.
+    Breakpoint { expr: String, set: bool },
     Step { thread: u32, over: bool },
-    ReadMemory { addr: u32, len: u32 },
-    WriteMemory { addr: u32, data: Vec<u8> },
+    ReadMemory { expr: String, len: u32 },
+    WriteMemory { expr: String, data: Vec<u8> },
+    /// Search a module (`None`: the running title) for a pattern.
+    FindMemory { pattern: Pattern, module: Option<String>, max: usize },
+    /// Save memory to a file; without a length, `expr` must be a module name.
+    DumpMemory { expr: String, len: Option<u32>, path: PathBuf },
+    ScanLibrary,
+    SyncPull { remote: String, local: PathBuf },
+    SyncPush { local: PathBuf, remote: String },
+    /// One command line for the Terminal tab.
+    Shell(String),
 }
 
 pub struct ConsoleInfo {
@@ -67,6 +79,10 @@ pub enum Reply {
     Registers { thread: u32, context: Context, stopped: Option<String> },
     Memory { addr: u32, bytes: Vec<Option<u8>> },
     Breakpoint { addr: u32, set: bool },
+    FindResults(Vec<(u32, String)>),
+    Library(Box<Library>),
+    /// Output of a Terminal command.
+    ShellOutput { line: String, text: String, error: bool, prompt: String },
     Event(Notification),
     EventsStopped,
     Status(String),
@@ -90,7 +106,8 @@ impl Worker {
         let tx = replies_tx.clone();
         let repaint = ctx.clone();
         thread::spawn(move || {
-            let mut state = State { addr: None, client: None };
+            let local_dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+            let mut state = State { addr: None, client: None, shell: Some(Shell::new(local_dir)), repaint: repaint.clone() };
             for job in job_rx {
                 let result = state.run(job, &tx);
                 if let Err(e) = result {
@@ -143,6 +160,9 @@ impl Worker {
 struct State {
     addr: Option<SocketAddr>,
     client: Option<Client>,
+    /// Taken out while a command runs, so it can borrow the connection.
+    shell: Option<Shell>,
+    repaint: egui::Context,
 }
 
 impl State {
@@ -171,8 +191,22 @@ impl State {
     }
 
     fn run(&mut self, job: Job, tx: &Sender<Reply>) -> xbdm::Result<()> {
+        let repaint = self.repaint.clone();
         let send = |r: Reply| {
             let _ = tx.send(r);
+            repaint.request_repaint();
+        };
+        // Progress of long memory operations, at most every 2%.
+        let progress = |what: &str| {
+            let mut last = u64::MAX;
+            let what = what.to_string();
+            move |done: u64, total: u64| {
+                let pct = (done * 100).checked_div(total).unwrap_or(100);
+                if last == u64::MAX || pct >= last + 2 || pct == 100 {
+                    last = pct;
+                    send(Reply::Status(format!("{what}: {pct}% of {}", human_size(total))));
+                }
+            }
         };
         match job {
             Job::Connect(spec) => {
@@ -275,11 +309,13 @@ impl State {
                 self.xbox(|c| c.debugger_connect("xbdk").and_then(|_| c.go()))?;
                 send(Reply::Status("execution resumed".into()));
             }
-            Job::Breakpoint { addr, set } => {
-                self.xbox(|c| {
+            Job::Breakpoint { expr, set } => {
+                let addr = self.xbox(|c| {
+                    let addr = c.resolve_address(&expr)?;
                     // See xbdk debug: breakpoints are only safe with a registered debugger.
                     c.debugger_connect("xbdk")?;
-                    if set { c.set_breakpoint(addr) } else { c.clear_breakpoint(addr) }
+                    if set { c.set_breakpoint(addr) } else { c.clear_breakpoint(addr) }?;
+                    Ok(addr)
                 })?;
                 send(Reply::Breakpoint { addr, set });
             }
@@ -289,13 +325,95 @@ impl State {
                 let (context, stopped) = self.xbox(|c| Ok((c.context(thread, false)?, c.stop_reason(thread)?)))?;
                 send(Reply::Registers { thread, context, stopped });
             }
-            Job::ReadMemory { addr, len } => {
-                let bytes = self.xbox(|c| c.get_memory(addr, len))?;
+            Job::ReadMemory { expr, len } => {
+                let (addr, bytes) = self.xbox(|c| {
+                    let addr = c.resolve_address(&expr)?;
+                    Ok((addr, c.get_memory(addr, len)?))
+                })?;
                 send(Reply::Memory { addr, bytes });
             }
-            Job::WriteMemory { addr, data } => {
-                self.xbox(|c| c.set_memory(addr, &data))?;
+            Job::WriteMemory { expr, data } => {
+                let addr = self.xbox(|c| {
+                    let addr = c.resolve_address(&expr)?;
+                    c.set_memory(addr, &data)?;
+                    Ok(addr)
+                })?;
                 send(Reply::Status(format!("wrote {} bytes at {addr:08X}", data.len())));
+            }
+            Job::FindMemory { pattern, module, max } => {
+                let mut report = progress("searching");
+                let hits = self.xbox(|c| {
+                    let (name, base, size) = match &module {
+                        Some(m) => {
+                            let (base, size) = c.module_range(m)?;
+                            (m.clone(), base, size)
+                        }
+                        None => c.title_module()?,
+                    };
+                    let hits = c.find_memory(base, size, &pattern, max, &mut report)?;
+                    Ok(hits.into_iter().map(|h| (h, format!("{name}+{:#x}", h - base))).collect::<Vec<_>>())
+                })?;
+                send(Reply::Status(format!("{} match(es)", hits.len())));
+                send(Reply::FindResults(hits));
+            }
+            Job::DumpMemory { expr, len, path } => {
+                let mut report = progress("dumping");
+                let (start, len, unmapped) = self.xbox(|c| {
+                    let (start, len) = match len {
+                        Some(len) => (c.resolve_address(&expr)?, len),
+                        None => c.module_range(&expr)?,
+                    };
+                    let file = std::fs::File::create(&path).map_err(|source| xbdm::Error::Local { path: path.clone(), source })?;
+                    let mut out = std::io::BufWriter::new(file);
+                    let unmapped = c.dump_memory(start, len, &mut out, &mut report)?;
+                    std::io::Write::flush(&mut out).map_err(|source| xbdm::Error::Local { path: path.clone(), source })?;
+                    Ok((start, len, unmapped))
+                })?;
+                let note = if unmapped > 0 { format!(", {unmapped} unmapped bytes as zeros") } else { String::new() };
+                send(Reply::Status(format!("dumped {start:08X} ({}) to {}{note}", human_size(len.into()), path.display())));
+            }
+            Job::ScanLibrary => {
+                let cache = name_cache_path();
+                let mut names = NameCache::load(&cache);
+                let library = self.xbox(|c| content::scan(c, &mut names, &mut |step| send(Reply::Status(step.to_string()))))?;
+                let _ = names.save(&cache);
+                send(Reply::Status(format!("{} titles", library.titles.len())));
+                send(Reply::Library(Box::new(library)));
+            }
+            Job::SyncPull { remote, local } => {
+                send(Reply::Status(format!("syncing {remote} -> {}…", local.display())));
+                let mut log = |r: &str, _: &std::path::Path, _: u64| send(Reply::Status(format!("downloaded {r}")));
+                let report = self.xbox(|c| transfer::sync_pull(c, &remote, &local, false, &mut log))?;
+                send(Reply::Status(format!(
+                    "{} copied ({}), {} unchanged -> {}",
+                    report.copied.files,
+                    human_size(report.copied.bytes),
+                    report.unchanged,
+                    local.display()
+                )));
+            }
+            Job::SyncPush { local, remote } => {
+                send(Reply::Status(format!("syncing {} -> {remote}…", local.display())));
+                let mut log = |r: &str, _: &std::path::Path, _: u64| send(Reply::Status(format!("uploaded {r}")));
+                let report = self.xbox(|c| transfer::sync_push(c, &local, &remote, false, &mut log))?;
+                send(Reply::Status(format!(
+                    "{} copied ({}), {} unchanged",
+                    report.copied.files,
+                    human_size(report.copied.bytes),
+                    report.unchanged
+                )));
+                send(Reply::Changed(remote));
+            }
+            Job::Shell(line) => {
+                let mut shell = self.shell.take().expect("shell is put back after every command");
+                let result = self.xbox(|c| shell.run(c, &line));
+                let prompt = shell.prompt();
+                self.shell = Some(shell);
+                let (text, error) = match result {
+                    Ok(reply) => (reply.text, false),
+                    Err(e) => (e.to_string(), true),
+                };
+                send(Reply::ShellOutput { line, text, error, prompt });
             }
         }
         Ok(())
@@ -333,15 +451,15 @@ pub fn parent_of(path: &str) -> String {
     }
 }
 
-pub fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 { format!("{bytes} B") } else { format!("{value:.1} {}", UNITS[unit]) }
+pub use xbdm::display::human_size;
+
+/// `$XDG_CACHE_HOME/xbdk/titles`, shared with the command-line tool.
+fn name_cache_path() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("xbdk").join("titles")
 }
 
 #[cfg(test)]

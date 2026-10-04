@@ -1,4 +1,4 @@
-//! The window: connection bar, tabs (Console, Files, Screen, Debug) and status bar.
+//! The window: connection bar, tabs (Console, Games, Files, Screen, Debug, Terminal) and status bar.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -6,11 +6,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Color32, RichText};
-use xbdm::{Console, Context, DirEntry, Screenshot};
+use xbdm::content::{self, Library};
+use xbdm::{Console, Context, DirEntry, Pattern, Screenshot};
 
+use crate::settings::Settings;
 use crate::worker::{human_size, parent_of, ConsoleInfo, Job, Reply, ThreadRow, Worker};
 
 const MAX_EVENTS: usize = 5000;
+const MAX_TERMINAL_LINES: usize = 5000;
 
 /// Something to do to the app after the file list has been drawn.
 type Action = Box<dyn FnOnce(&mut XbdkApp)>;
@@ -18,25 +21,71 @@ type Action = Box<dyn FnOnce(&mut XbdkApp)>;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Console,
+    Games,
     Files,
     Screen,
     Debug,
+    Terminal,
 }
 
 impl Tab {
     pub fn from_name(name: &str) -> Option<Tab> {
         match name.to_ascii_lowercase().as_str() {
             "console" => Some(Tab::Console),
+            "games" => Some(Tab::Games),
             "files" => Some(Tab::Files),
             "screen" => Some(Tab::Screen),
             "debug" => Some(Tab::Debug),
+            "terminal" => Some(Tab::Terminal),
             _ => None,
+        }
+    }
+}
+
+/// How the Debug tab's search box is interpreted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FindMode {
+    Hex,
+    Text,
+    WideText,
+    U32,
+}
+
+impl FindMode {
+    fn label(self) -> &'static str {
+        match self {
+            FindMode::Hex => "Hex bytes",
+            FindMode::Text => "Text",
+            FindMode::WideText => "Text (UTF-16)",
+            FindMode::U32 => "32-bit value",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            FindMode::Hex => "7C 08 ?? A6",
+            FindMode::Text | FindMode::WideText => "text",
+            FindMode::U32 => "hex value",
+        }
+    }
+
+    fn pattern(self, input: &str) -> Result<Pattern, String> {
+        if input.is_empty() {
+            return Err("enter something to search for".into());
+        }
+        match self {
+            FindMode::Hex => Pattern::from_hex(input).map_err(|e| e.to_string()),
+            FindMode::Text => Ok(Pattern::from_bytes(input.as_bytes())),
+            FindMode::WideText => Ok(Pattern::from_utf16(input)),
+            FindMode::U32 => parse_hex(input).map(Pattern::from_u32).ok_or_else(|| format!("not a hex value: {input}")),
         }
     }
 }
 
 /// A modal dialog waiting for the user.
 enum Dialog {
+    Dump { expr: String, len: String },
+    SyncPush { local: String },
     NewFolder { name: String },
     Rename { from: String, name: String },
     Delete { path: String, is_dir: bool },
@@ -80,17 +129,34 @@ pub struct XbdkApp {
     mem_len: String,
     memory: Option<(u32, Vec<Option<u8>>)>,
     mem_write: String,
+    find_mode: FindMode,
+    find_input: String,
+    find_module: String,
+    find_results: Vec<(u32, String)>,
     events_on: bool,
     events: Vec<(SystemTime, String)>,
+
+    library: Option<Box<Library>>,
+    games_filter: String,
+    games_all: bool,
+
+    /// Terminal scrollback: (text, is_error).
+    term_lines: Vec<(String, bool)>,
+    term_input: String,
+    term_prompt: String,
+    term_history: Vec<String>,
+    term_history_pos: Option<usize>,
+
+    settings: Settings,
 }
 
 impl XbdkApp {
     pub fn new(cc: &eframe::CreationContext<'_>, tab: Tab) -> XbdkApp {
         let worker = Worker::spawn(cc.egui_ctx.clone());
-        let console_input = std::env::var("XBDK_CONSOLE").unwrap_or_default();
-        let download_dir = std::env::var("HOME")
-            .map(|h| format!("{h}/Downloads"))
-            .unwrap_or_else(|_| ".".into());
+        let settings = Settings::load();
+        // XBDK_CONSOLE wins over the console used last time.
+        let console_input = std::env::var("XBDK_CONSOLE").ok().filter(|c| !c.is_empty()).unwrap_or_else(|| settings.console.clone());
+        let download_dir = settings.download_dir.clone();
         let mut app = XbdkApp {
             worker,
             pending: 0,
@@ -122,8 +188,21 @@ impl XbdkApp {
             mem_len: "100".into(),
             memory: None,
             mem_write: String::new(),
+            find_mode: FindMode::Hex,
+            find_input: String::new(),
+            find_module: String::new(),
+            find_results: Vec::new(),
             events_on: false,
             events: Vec::new(),
+            library: None,
+            games_filter: String::new(),
+            games_all: false,
+            term_lines: vec![("Type `help` for the list of commands.".into(), false)],
+            term_input: String::new(),
+            term_prompt: "HDD:\\> ".into(),
+            term_history: Vec::new(),
+            term_history_pos: None,
+            settings,
         };
         // Connect straight away: to XBDK_CONSOLE if set, otherwise to the only console found.
         app.job(Job::Connect(app.console_input.clone()));
@@ -144,6 +223,7 @@ impl XbdkApp {
                     self.error = None;
                     self.console_input = addr.ip().to_string();
                     self.connected = Some((addr, name));
+                    self.save_settings();
                     self.job(Job::Info);
                     self.job(Job::List(self.cwd.clone()));
                     self.on_tab_opened();
@@ -173,6 +253,18 @@ impl XbdkApp {
                 Reply::Threads(rows) => self.threads = rows,
                 Reply::Registers { thread, context, stopped } => self.registers = Some((thread, context, stopped)),
                 Reply::Memory { addr, bytes } => self.memory = Some((addr, bytes)),
+                Reply::FindResults(hits) => self.find_results = hits,
+                Reply::Library(library) => self.library = Some(library),
+                Reply::ShellOutput { line, text, error, prompt } => {
+                    self.term_lines.push((format!("{}{line}", self.term_prompt), false));
+                    if !text.is_empty() {
+                        self.term_lines.push((text.trim_end().to_string(), error));
+                    }
+                    self.term_prompt = prompt;
+                    if self.term_lines.len() > MAX_TERMINAL_LINES {
+                        self.term_lines.drain(..self.term_lines.len() - MAX_TERMINAL_LINES);
+                    }
+                }
                 Reply::Breakpoint { addr, set } => {
                     if set {
                         self.breakpoints.insert(addr);
@@ -222,7 +314,14 @@ impl XbdkApp {
                     }
                 });
             ui.separator();
-            for (tab, label) in [(Tab::Console, "Console"), (Tab::Files, "Files"), (Tab::Screen, "Screen"), (Tab::Debug, "Debug")] {
+            for (tab, label) in [
+                (Tab::Console, "Console"),
+                (Tab::Games, "Games"),
+                (Tab::Files, "Files"),
+                (Tab::Screen, "Screen"),
+                (Tab::Debug, "Debug"),
+                (Tab::Terminal, "Terminal"),
+            ] {
                 if ui.selectable_label(self.tab == tab, label).clicked() && self.tab != tab {
                     self.tab = tab;
                     self.on_tab_opened();
@@ -374,6 +473,9 @@ impl XbdkApp {
             if ui.button("New folder").clicked() {
                 self.dialog = Some(Dialog::NewFolder { name: String::new() });
             }
+            if ui.button("Sync from local…").on_hover_text("Copy new and changed files from a local folder into this folder").clicked() {
+                self.dialog = Some(Dialog::SyncPush { local: self.download_dir.clone() });
+            }
             let edit = ui.add(egui::TextEdit::singleline(&mut self.cwd).desired_width(ui.available_width() - 8.0));
             if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 self.job(Job::List(self.cwd.clone()));
@@ -419,6 +521,14 @@ impl XbdkApp {
                                 let local_dir = PathBuf::from(&app.download_dir);
                                 let _ = std::fs::create_dir_all(&local_dir);
                                 app.job(Job::Download { remote: full, is_dir, local_dir });
+                            }));
+                            ui.close();
+                        }
+                        if is_dir && ui.button("Sync to download folder").on_hover_text("Copy only new and changed files").clicked() {
+                            let (full, name) = (full.clone(), name.clone());
+                            action = Some(Box::new(move |app| {
+                                let local = PathBuf::from(&app.download_dir).join(safe_file_name(&name));
+                                app.job(Job::SyncPull { remote: full, local });
                             }));
                             ui.close();
                         }
@@ -505,6 +615,7 @@ impl XbdkApp {
         match self.tab {
             Tab::Screen if self.screen.is_none() && !self.shot_pending => self.request_screenshot(),
             Tab::Debug if self.threads.is_empty() => self.job(Job::Threads),
+            Tab::Games if self.library.is_none() => self.job(Job::ScanLibrary),
             _ => {}
         }
     }
@@ -603,12 +714,9 @@ impl XbdkApp {
 
         ui.horizontal_wrapped(|ui| {
             ui.strong("Breakpoints");
-            ui.add(egui::TextEdit::singleline(&mut self.bp_input).hint_text("address").desired_width(100.0));
-            if ui.button("Add").clicked() {
-                match parse_hex(&self.bp_input) {
-                    Some(addr) => self.job(Job::Breakpoint { addr, set: true }),
-                    None => self.error = Some(format!("not a hex address: {}", self.bp_input)),
-                }
+            ui.add(egui::TextEdit::singleline(&mut self.bp_input).hint_text("address or module+offset").desired_width(170.0));
+            if ui.button("Add").clicked() && !self.bp_input.trim().is_empty() {
+                self.job(Job::Breakpoint { expr: self.bp_input.trim().to_string(), set: true });
             }
             let mut remove = None;
             for &addr in &self.breakpoints {
@@ -617,34 +725,73 @@ impl XbdkApp {
                 }
             }
             if let Some(addr) = remove {
-                self.job(Job::Breakpoint { addr, set: false });
+                self.job(Job::Breakpoint { expr: format!("{addr:08X}"), set: false });
             }
         });
         ui.separator();
 
         ui.horizontal_wrapped(|ui| {
             ui.strong("Memory");
-            ui.add(egui::TextEdit::singleline(&mut self.mem_addr).desired_width(90.0));
+            ui.add(egui::TextEdit::singleline(&mut self.mem_addr).hint_text("address or module+offset").desired_width(170.0));
             ui.label("length");
             ui.add(egui::TextEdit::singleline(&mut self.mem_len).desired_width(50.0));
             if ui.button("Read").clicked() {
-                match (parse_hex(&self.mem_addr), parse_hex(&self.mem_len)) {
-                    (Some(addr), Some(len)) if len > 0 && len <= 0x10000 => self.job(Job::ReadMemory { addr, len }),
-                    _ => self.error = Some("enter a hex address and a length up to 10000".into()),
+                match parse_hex(&self.mem_len) {
+                    Some(len) if len > 0 && len <= 0x10000 => self.job(Job::ReadMemory { expr: self.mem_addr.trim().to_string(), len }),
+                    _ => self.error = Some("length must be hex, up to 10000".into()),
                 }
             }
             ui.separator();
-            ui.add(egui::TextEdit::singleline(&mut self.mem_write).hint_text("hex bytes to write").desired_width(160.0));
+            ui.add(egui::TextEdit::singleline(&mut self.mem_write).hint_text("hex bytes to write").desired_width(150.0));
             if ui.button("Write").clicked() {
-                match (parse_hex(&self.mem_addr), parse_bytes(&self.mem_write)) {
-                    (Some(addr), Some(data)) if !data.is_empty() => {
-                        self.job(Job::WriteMemory { addr, data });
+                match parse_bytes(&self.mem_write) {
+                    Some(data) if !data.is_empty() => {
+                        let expr = self.mem_addr.trim().to_string();
+                        self.job(Job::WriteMemory { expr: expr.clone(), data });
                         if let Some(len) = parse_hex(&self.mem_len) {
-                            self.job(Job::ReadMemory { addr, len });
+                            self.job(Job::ReadMemory { expr, len });
                         }
                     }
-                    _ => self.error = Some("enter an address and an even number of hex digits".into()),
+                    _ => self.error = Some("enter an even number of hex digits".into()),
                 }
+            }
+            ui.separator();
+            if ui.button("Dump…").on_hover_text("Save memory to a file in the download folder. With a module name and no length, the whole module.").clicked() {
+                self.dialog = Some(Dialog::Dump { expr: self.mem_addr.trim().to_string(), len: String::new() });
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Search");
+            egui::ComboBox::from_id_salt("find_mode").selected_text(self.find_mode.label()).show_ui(ui, |ui| {
+                for mode in [FindMode::Hex, FindMode::Text, FindMode::WideText, FindMode::U32] {
+                    ui.selectable_value(&mut self.find_mode, mode, mode.label());
+                }
+            });
+            ui.add(egui::TextEdit::singleline(&mut self.find_input).hint_text(self.find_mode.hint()).desired_width(170.0));
+            ui.label("in");
+            ui.add(egui::TextEdit::singleline(&mut self.find_module).hint_text("running title").desired_width(110.0));
+            if ui.button("Find").clicked() {
+                match self.find_mode.pattern(&self.find_input) {
+                    Ok(pattern) => {
+                        let module = Some(self.find_module.trim().to_string()).filter(|m| !m.is_empty());
+                        self.find_results.clear();
+                        self.job(Job::FindMemory { pattern, module, max: 200 });
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            let mut open = None;
+            for (addr, label) in self.find_results.iter().take(12) {
+                if ui.link(format!("{addr:08X}")).on_hover_text(label).clicked() {
+                    open = Some(*addr);
+                }
+            }
+            if self.find_results.len() > 12 {
+                ui.label(format!("+{} more", self.find_results.len() - 12));
+            }
+            if let Some(addr) = open {
+                self.mem_addr = format!("{addr:08X}");
+                self.job(Job::ReadMemory { expr: self.mem_addr.clone(), len: parse_hex(&self.mem_len).unwrap_or(0x100) });
             }
         });
         let available = ui.available_height();
@@ -671,6 +818,157 @@ impl XbdkApp {
         });
     }
 
+    // ---- Games tab -----------------------------------------------------------
+
+    fn games_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Games and content");
+            if ui.button("⟳ Rescan").clicked() {
+                self.job(Job::ScanLibrary);
+            }
+            ui.add(egui::TextEdit::singleline(&mut self.games_filter).hint_text("filter by name or title ID").desired_width(200.0));
+            ui.checkbox(&mut self.games_all, "Show titles without a game (saves, avatar items, …)");
+        });
+        let Some(library) = &self.library else {
+            ui.label("Scanning HDD:\\Content…");
+            return;
+        };
+        if !library.profiles.is_empty() {
+            let ids: Vec<&str> = library.profiles.iter().map(|p| p.id.as_str()).collect();
+            ui.label(RichText::new(format!("Profiles: {}", ids.join(", "))).weak());
+        }
+        ui.separator();
+
+        let filter = self.games_filter.to_lowercase();
+        let mut action: Option<Action> = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            for title in &library.titles {
+                let name = title.name.clone().unwrap_or_else(|| "(unknown)".into());
+                let id = format!("{:08X}", title.title_id);
+                if !self.games_all && !title.has_game() {
+                    continue;
+                }
+                if !filter.is_empty() && !name.to_lowercase().contains(&filter) && !id.to_lowercase().contains(&filter) {
+                    continue;
+                }
+                let kinds: Vec<String> = title
+                    .kinds()
+                    .iter()
+                    .map(|(k, n)| if *n > 1 { format!("{} ×{n}", content::content_type_name(*k)) } else { content::content_type_name(*k).to_string() })
+                    .collect();
+                let header = RichText::new(format!("{name}    {id}    {}", human_size(title.size()))).strong();
+                egui::CollapsingHeader::new(header).id_salt(title.title_id).show(ui, |ui| {
+                    ui.label(RichText::new(kinds.join(", ")).weak());
+                    egui::Grid::new(("packages", title.title_id)).num_columns(4).striped(true).spacing([16.0, 2.0]).show(ui, |ui| {
+                        for p in &title.packages {
+                            ui.label(content::content_type_name(p.kind));
+                            ui.label(human_size(p.size));
+                            ui.label(RichText::new(&p.path).monospace().small());
+                            if ui.small_button("Show in Files").clicked() {
+                                let dir = parent_of(&p.path);
+                                action = Some(Box::new(move |app| {
+                                    app.tab = Tab::Files;
+                                    app.job(Job::List(dir));
+                                }));
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    let has_saves = title.packages.iter().any(|p| p.kind == 1);
+                    ui.horizontal(|ui| {
+                        if has_saves && ui.button("Back up saves").on_hover_text("Sync this title's saved games into the download folder").clicked() {
+                            let folders = title_folders(title, Some(1));
+                            let base = PathBuf::from(&self.download_dir).join(safe_file_name(&format!("{name} ({id}) saves")));
+                            action = Some(Box::new(move |app| {
+                                for (profile, remote) in folders {
+                                    app.job(Job::SyncPull { remote, local: base.join(profile) });
+                                }
+                            }));
+                        }
+                        if ui.button("Back up everything").on_hover_text("Sync all of this title's content (games can be several GB)").clicked() {
+                            let folders = title_folders(title, None);
+                            let base = PathBuf::from(&self.download_dir).join(safe_file_name(&format!("{name} ({id})")));
+                            action = Some(Box::new(move |app| {
+                                for (profile, remote) in folders {
+                                    app.job(Job::SyncPull { remote, local: base.join(profile) });
+                                }
+                            }));
+                        }
+                    });
+                });
+            }
+        });
+        if let Some(action) = action {
+            action(self);
+        }
+    }
+
+    // ---- Terminal tab ---------------------------------------------------------
+
+    fn terminal_tab(&mut self, ui: &mut egui::Ui) {
+        let input_height = 32.0;
+        egui::ScrollArea::vertical()
+            .id_salt("terminal")
+            .stick_to_bottom(true)
+            .auto_shrink(false)
+            .max_height(ui.available_height() - input_height)
+            .show(ui, |ui| {
+                for (text, error) in &self.term_lines {
+                    let text = RichText::new(text).monospace();
+                    ui.label(if *error { text.color(Color32::from_rgb(230, 90, 80)) } else { text });
+                }
+            });
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.monospace(&self.term_prompt);
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.term_input)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(if self.connected.is_some() { "command (help for a list)" } else { "not connected" }),
+            );
+            let (enter, up, down) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown)));
+            if edit.has_focus() && up && !self.term_history.is_empty() {
+                let pos = self.term_history_pos.map_or(self.term_history.len() - 1, |p| p.saturating_sub(1));
+                self.term_history_pos = Some(pos);
+                self.term_input = self.term_history[pos].clone();
+            }
+            if edit.has_focus() && down {
+                match self.term_history_pos {
+                    Some(p) if p + 1 < self.term_history.len() => {
+                        self.term_history_pos = Some(p + 1);
+                        self.term_input = self.term_history[p + 1].clone();
+                    }
+                    _ => {
+                        self.term_history_pos = None;
+                        self.term_input.clear();
+                    }
+                }
+            }
+            if edit.lost_focus() && enter {
+                let line = std::mem::take(&mut self.term_input);
+                if line.trim() == "clear" {
+                    self.term_lines.clear();
+                } else if !line.trim().is_empty() {
+                    if self.term_history.last() != Some(&line) {
+                        self.term_history.push(line.clone());
+                    }
+                    self.job(Job::Shell(line));
+                }
+                self.term_history_pos = None;
+                edit.request_focus();
+            }
+        });
+    }
+
+    fn save_settings(&mut self) {
+        self.settings.console = self.console_input.clone();
+        self.settings.download_dir = self.download_dir.clone();
+        if let Err(e) = self.settings.save() {
+            self.error = Some(format!("saving settings: {e}"));
+        }
+    }
+
     // ---- dialogs -------------------------------------------------------------
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -680,6 +978,43 @@ impl XbdkApp {
         egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
             ui.set_width(380.0);
             match dialog {
+                Dialog::Dump { expr, len } => {
+                    ui.heading("Dump memory");
+                    ui.label("Start (hex address, module, or module+offset):");
+                    ui.text_edit_singleline(expr);
+                    ui.label("Length in hex (leave empty to dump a whole module):");
+                    ui.text_edit_singleline(len);
+                    ui.label(RichText::new(format!("Saved to {}", self.download_dir)).weak());
+                    ui.horizontal(|ui| {
+                        if ui.button("Dump").clicked() && !expr.trim().is_empty() {
+                            let len_value = parse_hex(len);
+                            if len.trim().is_empty() || len_value.is_some() {
+                                let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                                let path = PathBuf::from(&self.download_dir).join(format!("{}-{secs}.bin", safe_file_name(expr.trim())));
+                                job = Some(Job::DumpMemory { expr: expr.trim().to_string(), len: len_value, path });
+                                close = true;
+                            }
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::SyncPush { local } => {
+                    ui.heading("Sync from local folder");
+                    ui.label("Local folder:");
+                    ui.text_edit_singleline(local);
+                    ui.label(format!("New and changed files are copied into {}. Nothing is deleted.", self.cwd));
+                    ui.horizontal(|ui| {
+                        if ui.button("Sync").clicked() && !local.trim().is_empty() {
+                            job = Some(Job::SyncPush { local: PathBuf::from(local.trim()), remote: self.cwd.clone() });
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
                 Dialog::NewFolder { name } => {
                     ui.heading("New folder");
                     ui.label(format!("in {}", self.cwd));
@@ -787,6 +1122,8 @@ impl eframe::App for XbdkApp {
             Tab::Files => self.files_tab(ui),
             Tab::Screen => self.screen_tab(ui),
             Tab::Debug => self.debug_tab(ui),
+            Tab::Games => self.games_tab(ui),
+            Tab::Terminal => self.terminal_tab(ui),
         });
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
@@ -801,7 +1138,36 @@ impl eframe::App for XbdkApp {
 
     fn on_exit(&mut self) {
         self.worker.stop_events();
+        self.save_settings();
     }
+}
+
+/// Turns a title or console name into something safe to use as a local file name.
+fn safe_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control() { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim().trim_matches('.').to_string();
+    if cleaned.is_empty() { "unnamed".into() } else { cleaned }
+}
+
+/// The `Content\<profile>\<title>` folders holding a title's packages (optionally of one
+/// content type), as (profile, console folder) pairs.
+fn title_folders(title: &content::TitleContent, kind: Option<u32>) -> Vec<(String, String)> {
+    let mut folders: Vec<(String, String)> = Vec::new();
+    for p in title.packages.iter().filter(|p| kind.is_none_or(|k| p.kind == k)) {
+        // .../<profile>/<title>/<kind>/<file>: the title folder is two levels up.
+        let folder = parent_of(&parent_of(&p.path));
+        let folder = match kind {
+            Some(k) => format!("{folder}\\{k:08X}"),
+            None => folder,
+        };
+        if !folders.iter().any(|(_, f)| *f == folder) {
+            folders.push((p.profile.clone(), folder));
+        }
+    }
+    folders
 }
 
 fn status_dot(ui: &mut egui::Ui, color: Color32) {
@@ -879,6 +1245,22 @@ fn clock(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_and_folders() {
+        assert_eq!(safe_file_name("The Orange Box: HL2 / TF2"), "The Orange Box_ HL2 _ TF2");
+        assert_eq!(safe_file_name(".."), "unnamed");
+        let title = content::TitleContent {
+            title_id: 0x454108E6,
+            name: None,
+            packages: vec![
+                content::Package { path: "HDD:\\Content\\E0\\454108E6\\00000001\\ALIAS".into(), profile: "E0".into(), kind: 1, size: 1 },
+                content::Package { path: "HDD:\\Content\\00\\454108E6\\00007000\\G".into(), profile: "00".into(), kind: 0x7000, size: 1 },
+            ],
+        };
+        assert_eq!(title_folders(&title, Some(1)), [("E0".to_string(), "HDD:\\Content\\E0\\454108E6\\00000001".to_string())]);
+        assert_eq!(title_folders(&title, None).len(), 2);
+    }
 
     #[test]
     fn helpers() {

@@ -1,12 +1,14 @@
 //! `xbdk debug`, `xbdk mem` and `xbdk modules`.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 use clap::{Subcommand, ValueEnum};
-use xbdm::{Client, Watch};
+
+use xbdm::{Client, Pattern, Watch};
 
 /// Parses an address or thread id: hex with or without `0x`.
 pub fn parse_hex(s: &str) -> Result<u32, String> {
@@ -83,8 +85,9 @@ pub enum DebugCmd {
     },
     /// Set or clear a code breakpoint.
     Break {
-        #[arg(value_parser = parse_hex, required_unless_present = "clear_all")]
-        addr: Option<u32>,
+        /// Hex address, or MODULE+OFFSET.
+        #[arg(required_unless_present = "clear_all")]
+        addr: Option<String>,
         #[arg(long)]
         clear: bool,
         /// Remove every breakpoint.
@@ -94,8 +97,7 @@ pub enum DebugCmd {
     /// Set or clear a hardware data breakpoint.
     Watch {
         kind: WatchKind,
-        #[arg(value_parser = parse_hex)]
-        addr: u32,
+        addr: String,
         /// Bytes to watch (hex).
         #[arg(value_parser = parse_hex, default_value = "4")]
         size: u32,
@@ -108,19 +110,46 @@ pub enum DebugCmd {
 
 #[derive(Subcommand)]
 pub enum MemCmd {
-    /// Hex dump of console memory.
+    /// Hex dump of console memory. ADDR: hex, a module name, or MODULE+OFFSET.
     Read {
-        #[arg(value_parser = parse_hex)]
-        addr: u32,
+        addr: String,
         /// Number of bytes (hex).
         #[arg(value_parser = parse_hex, default_value = "100")]
         len: u32,
     },
-    /// Write bytes given as hex, e.g. `mem write 82001000 60000000`.
-    Write {
+    /// Write bytes given as hex, e.g. `mem write default.xex+0x1000 60000000`.
+    Write { addr: String, hex: String },
+    /// Save memory to a file. With a module name and no length, the whole module.
+    Dump {
+        addr: String,
+        /// Number of bytes (hex). Defaults to the module size when ADDR is a module.
         #[arg(value_parser = parse_hex)]
-        addr: u32,
-        hex: String,
+        len: Option<u32>,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Search memory for a byte pattern (hex with ?? wildcards), text, or a 32-bit value.
+    Find {
+        /// Hex bytes such as "7C 08 ?? A6". Not needed with --text or --u32.
+        pattern: Option<String>,
+        /// Search for this text (ASCII/UTF-8).
+        #[arg(long, conflicts_with_all = ["pattern", "u32"])]
+        text: Option<String>,
+        /// Also accept the text as UTF-16 (wide strings).
+        #[arg(long, requires = "text")]
+        wide: bool,
+        /// Search for this big-endian 32-bit value (hex).
+        #[arg(long, value_parser = parse_hex, conflicts_with = "pattern")]
+        u32: Option<u32>,
+        /// Module to search (default: the running title's executable).
+        #[arg(long, conflicts_with = "range")]
+        module: Option<String>,
+        /// Search ADDR LEN instead of a module (hex).
+        #[arg(long, num_args = 2, value_names = ["ADDR", "LEN"])]
+        range: Option<Vec<String>>,
+        /// Stop after this many matches.
+        #[arg(long, default_value_t = 100)]
+        max: usize,
     },
     /// List committed memory regions.
     Map,
@@ -171,11 +200,18 @@ pub fn run_debug(mut xbox: Client, cmd: DebugCmd) -> Result<()> {
         }
         DebugCmd::Break { addr, clear, clear_all } => match (addr, clear_all) {
             (_, true) => xbox.clear_all_breakpoints()?,
-            (Some(a), _) if clear => xbox.clear_breakpoint(a)?,
-            (Some(a), _) => xbox.set_breakpoint(a)?,
+            (Some(a), _) if clear => {
+                let a = xbox.resolve_address(&a)?;
+                xbox.clear_breakpoint(a)?
+            }
+            (Some(a), _) => {
+                let a = xbox.resolve_address(&a)?;
+                xbox.set_breakpoint(a)?
+            }
             (None, false) => bail!("an address is required"),
         },
         DebugCmd::Watch { kind, addr, size, clear } => {
+            let addr = xbox.resolve_address(&addr)?;
             if clear {
                 xbox.clear_watchpoint(kind.into(), addr, size)?;
             } else {
@@ -201,20 +237,11 @@ pub fn run_debug(mut xbox: Client, cmd: DebugCmd) -> Result<()> {
 pub fn run_mem(mut xbox: Client, cmd: MemCmd) -> Result<()> {
     match cmd {
         MemCmd::Read { addr, len } => {
-            let bytes = xbox.get_memory(addr, len)?;
-            for (row, chunk) in bytes.chunks(16).enumerate() {
-                let hex: Vec<String> = chunk.iter().map(|b| b.map_or("??".into(), |b| format!("{b:02X}"))).collect();
-                let ascii: String = chunk
-                    .iter()
-                    .map(|b| match b {
-                        Some(c) if c.is_ascii_graphic() || *c == b' ' => *c as char,
-                        _ => '.',
-                    })
-                    .collect();
-                println!("{:08X}  {:<47}  {ascii}", addr.wrapping_add(row as u32 * 16), hex.join(" "));
-            }
+            let addr = xbox.resolve_address(&addr)?;
+            print!("{}", xbdm::display::hexdump(addr, &xbox.get_memory(addr, len)?));
         }
         MemCmd::Write { addr, hex } => {
+            let addr = xbox.resolve_address(&addr)?;
             let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
             if !hex.len().is_multiple_of(2) {
                 bail!("hex data must have an even number of digits");
@@ -226,6 +253,56 @@ pub fn run_mem(mut xbox: Client, cmd: MemCmd) -> Result<()> {
                 .context("invalid hex data")?;
             xbox.set_memory(addr, &data)?;
             println!("wrote {} bytes at {addr:08X}", data.len());
+        }
+        MemCmd::Dump { addr, len, output } => {
+            let (start, len) = match len {
+                Some(len) => (xbox.resolve_address(&addr)?, len),
+                None => xbox.module_range(&addr).context("give a length, or a module name to dump a whole module")?,
+            };
+            let file = std::fs::File::create(&output).with_context(|| format!("creating {}", output.display()))?;
+            let mut out = std::io::BufWriter::new(file);
+            let unmapped = xbox.dump_memory(start, len, &mut out, &mut progress_bar)?;
+            std::io::Write::flush(&mut out)?;
+            end_progress();
+            println!("{start:08X}..{:08X} -> {} ({})", start.wrapping_add(len), output.display(), crate::human_size(len.into()));
+            if unmapped > 0 {
+                println!("{unmapped} unmapped bytes were written as zeros");
+            }
+        }
+        MemCmd::Find { pattern, text, wide, u32, module, range, max } => {
+            let pattern = match (pattern, text, u32) {
+                (Some(hex), _, _) => Pattern::from_hex(&hex)?,
+                (_, Some(t), _) if wide => Pattern::from_utf16(&t),
+                (_, Some(t), _) => Pattern::from_bytes(t.as_bytes()),
+                (_, _, Some(v)) => Pattern::from_u32(v),
+                _ => bail!("give a hex pattern, --text or --u32"),
+            };
+            let (start, len, label) = match range {
+                Some(r) => {
+                    let start = xbox.resolve_address(&r[0])?;
+                    let len = parse_hex(&r[1]).map_err(anyhow::Error::msg)?;
+                    (start, len, None)
+                }
+                None => {
+                    let (name, base, size) = match module {
+                        Some(m) => {
+                            let (base, size) = xbox.module_range(&m)?;
+                            (m, base, size)
+                        }
+                        None => xbox.title_module()?,
+                    };
+                    (base, size, Some(name))
+                }
+            };
+            let hits = xbox.find_memory(start, len, &pattern, max, &mut progress_bar)?;
+            end_progress();
+            for h in &hits {
+                match &label {
+                    Some(m) => println!("{h:08X}  {m}+{:#x}", h - start),
+                    None => println!("{h:08X}"),
+                }
+            }
+            println!("{} match(es){}", hits.len(), if hits.len() == max { " (limit reached)" } else { "" });
         }
         MemCmd::Map => {
             println!("{:<10} {:<10} {:>10}  Access", "Start", "End", "Size");
@@ -241,6 +318,21 @@ pub fn run_mem(mut xbox: Client, cmd: MemCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn end_progress() {
+    if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        eprintln!();
+    }
+}
+
+/// One-line progress display on stderr (only when it is a terminal).
+fn progress_bar(done: u64, total: u64) {
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+        return;
+    }
+    let pct = (done * 100).checked_div(total).unwrap_or(100);
+    eprint!("\r{pct:>3}%  {} of {}", crate::human_size(done), crate::human_size(total));
 }
 
 /// `xbdk modules [--sections NAME]`

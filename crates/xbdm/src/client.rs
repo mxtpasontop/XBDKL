@@ -65,6 +65,13 @@ fn filetime_to_system(ft: u64) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::new(secs, nanos as u32))
 }
 
+/// Converts a `SystemTime` to a Windows FILETIME (times before 1970 become 1970).
+fn system_to_filetime(t: SystemTime) -> u64 {
+    const EPOCH_DIFF_SECS: u64 = 11_644_473_600;
+    let since = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+    (since.as_secs() + EPOCH_DIFF_SECS) * 10_000_000 + u64::from(since.subsec_nanos()) / 100
+}
+
 pub struct Client {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
@@ -174,6 +181,28 @@ impl Client {
         self.writer.write_all(b"\r\n")?;
         self.writer.flush()?;
         self.read_status()?.check()
+    }
+
+    /// Sends an arbitrary command and returns its status line plus any multiline body.
+    /// Commands that transfer binary data or change the connection's mode are refused,
+    /// since they would leave the connection out of sync.
+    pub fn raw_command(&mut self, command: &str) -> Result<(Status, Vec<String>)> {
+        const REFUSED: [&str; 8] = ["getfile", "sendfile", "writefile", "screenshot", "getmemex", "notify", "notifyat", "bye"];
+        let verb = command.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
+        if REFUSED.contains(&verb.as_str()) {
+            return Err(Error::InvalidArgument(format!("{verb} can't be sent raw; use the dedicated command")));
+        }
+        let status = self.send_command(command)?;
+        let body = match status.code {
+            code::MULTILINE => self.read_body()?,
+            code::BINARY | code::SEND_BINARY => {
+                // Unknown binary exchange: the connection can't be trusted any more.
+                self.reconnect()?;
+                return Err(Error::Protocol(format!("{verb} started a binary transfer; reconnected")));
+            }
+            _ => Vec::new(),
+        };
+        Ok((status, body))
     }
 
     /// Runs a command that answers with a single `200-` line and returns its text.
@@ -288,6 +317,21 @@ impl Client {
         let target = path::normalize(target)?;
         let suffix = if is_dir { " dir" } else { "" };
         self.send_command(&format!("delete name={}{suffix}", quote(&target)?))?;
+        Ok(())
+    }
+
+    /// Sets a file's creation and modification times.
+    pub fn set_file_times(&mut self, file: &str, created: SystemTime, modified: SystemTime) -> Result<()> {
+        let file = path::normalize(file)?;
+        let (c, m) = (system_to_filetime(created), system_to_filetime(modified));
+        self.send_command(&format!(
+            "setfileattributes name={} createhi=0x{:08x} createlo=0x{:08x} changehi=0x{:08x} changelo=0x{:08x}",
+            quote(&file)?,
+            c >> 32,
+            c as u32,
+            m >> 32,
+            m as u32
+        ))?;
         Ok(())
     }
 
@@ -443,5 +487,6 @@ mod tests {
         let t = filetime_to_system(0x01c5ef5c_81954400).unwrap();
         assert_eq!(t.duration_since(UNIX_EPOCH).unwrap().as_secs(), 1_132_660_904);
         assert_eq!(filetime_to_system(0), None);
+        assert_eq!(system_to_filetime(t), 0x01c5ef5c_81954400);
     }
 }

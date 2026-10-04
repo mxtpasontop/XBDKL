@@ -11,17 +11,21 @@ It works with development kits and with modified consoles (RGH/JTAG, BadUpdate) 
 | | |
 |---|---|
 | **`xbdk`** | Command-line tool: files, screenshots, title info, debugger, and a FUSE mount |
-| **`xbdk-gui`** | Desktop app with Console, Files, Screen and Debug tabs |
+| **`xbdk-gui`** | Desktop app with Console, Games, Files, Screen, Debug and Terminal tabs |
 | **`xbdm`** | The protocol library both are built on |
 
 ## Features
 
 - **Discovery:** finds consoles on the local network, or connects by IP or debug name.
 - **Files:** list, download, upload (including whole folders), rename, delete, mkdir, and free space per drive.
+- **Game library:** installed games, saves, DLC, title updates and more, with real names and sizes; back up saves in one click.
+- **Sync:** copy only new and changed files in either direction, keeping timestamps (ideal for save backups).
+- **Interactive shell:** `cd`, `ls`, `get`, `put`, `cat`, `mem`, `find`, ... over one connection, in the terminal or in the app.
 - **Mount:** the console's drives as a normal folder (FUSE), usable from any file manager, `cp` or `rsync`.
 - **Screenshots:** the GPU's tiled framebuffer decoded to PNG; the app also has a live view.
 - **Title info:** name, title ID, media ID and version of the running game, including installed title updates.
 - **Power:** launch an `.xex`, warm or cold reboot.
+- **Memory tools:** dump memory or whole modules to a file, search for byte patterns (with `??` wildcards), text or values, and use addresses like `default.xex+0x1234`.
 - **Debugging:** threads, registers, memory read/write/map, module sections, stop/go, breakpoints, watchpoints, stepping, and a live event stream (debug output, breakpoints, exceptions, module and thread events).
 
 ## Install
@@ -62,13 +66,41 @@ xbdk mkdir HDD:/Games
 xbdk mv HDD:/a.xex HDD:/b.xex
 xbdk rm HDD:/b.xex                   # rm --dir for an empty folder
 
+# Games, saves and DLC (names are cached in ~/.cache/xbdk/titles)
+xbdk games [--all] [--verbose]
+
+# Copy only new and changed files (-n: dry run)
+xbdk sync get 'HDD:\Content\E0000123456789AB\454108E6' ~/xbox-saves/skate3
+xbdk sync put ~/mods 'HDD:\Mods'
+
+# Interactive shell with history
+xbdk shell
+
 # Titles and power
 xbdk launch HDD:/Games/Foo/default.xex
 xbdk reboot [--cold]
 
 # Mount (Ctrl-C or `fusermount3 -u ~/xbox` to unmount)
 xbdk mount ~/xbox [--read-only]
+
+# Tab completion
+xbdk completions bash > ~/.local/share/bash-completion/completions/xbdk   # or zsh, fish
 ```
+
+### Shell
+
+`xbdk shell` (and the app's Terminal tab) keeps one connection open and a current folder:
+
+```
+HDD:\> cd Content/E0000123456789AB/454108E6
+HDD:\Content\E0000123456789AB\454108E6> ls -l
+HDD:\Content\E0000123456789AB\454108E6> get 00000001     # a whole folder (saves)
+HDD:\> find "7C 08 02 A6"                            # in the running title
+HDD:\> mem default.xex+0x1000 40
+HDD:\> raw dbgname                                   # any XBDM text command
+```
+
+`help` lists every command. Paths without a drive are relative to the current folder.
 
 ### Mount notes
 
@@ -84,16 +116,24 @@ xbdk-gui                    # or: xbdk-gui --tab screen
 ```
 
 - **Console:** system info, the running title, drive usage, reboot and launch.
-- **Files:** click drives and folders to browse; right-click to download, launch, rename or delete; drop files or folders on the window to upload them into the current folder.
+- **Games:** installed titles with names, sizes and content types; expand one to see its packages, jump to them in Files, or back up its saves or all of its content.
+- **Files:** click drives and folders to browse; right-click to download, sync to the download folder, launch, rename or delete; drop files or folders on the window to upload them; "Sync from local…" copies only new and changed files.
 - **Screen:** single or live screenshots, which can be saved as PNG.
-- **Debug:** threads, registers, stop/go/step, breakpoints, a memory viewer and editor, and the event log.
+- **Debug:** threads, registers, stop/go/step, breakpoints, a memory viewer and editor, memory search and dump, and the event log.
+- **Terminal:** the same shell as `xbdk shell`, with command history (Up/Down).
+
+The app remembers the console and download folder in `~/.config/xbdk/gui.conf`.
 
 ## Debugging
 
 ```sh
 xbdk modules [--sections default.xex]
 xbdk mem read 82000000 100           # hex dump (address and length in hex)
+xbdk mem read default.xex+0x1000     # addresses can be MODULE+OFFSET
 xbdk mem write 82000000 60000000
+xbdk mem dump default.xex -o game.bin          # a whole module, or ADDR LEN
+xbdk mem find "7C 08 ?? A6"                    # in the running title; --module, --range
+xbdk mem find --text "Skate" [--wide]          # ASCII or UTF-16 text; --u32 VALUE
 xbdk mem map
 xbdk debug threads
 xbdk debug regs THREAD [--fp]
@@ -153,6 +193,9 @@ Other XBDM builds may behave differently.
 - Screenshots are 32-bit B,G,R,X pixels in the Xenos tiled layout. The `format` field's bit `0x100` marks a tiled buffer.
 - The running title's execution info, which includes the version from an installed title update, is read from its in-memory XEX header, found through the kernel export `XexExecutableModuleHandle`.
 - `notify` requires `reconnectport=…`. With `reverse`, the same connection turns into the event stream.
+- `getmem` returns hex text at about 570 KiB/s, so dumping or searching an 18 MB game image takes about 30 seconds. `getmemex` answers `203` but sends no data.
+- `setfileattributes` sets file times (FAT keeps them to 2 seconds), which is what keeps `sync` from copying unchanged files again.
+- Game names come from package headers in `HDD:\Content`. Games on Demand headers are small separate files; profile packages carry no readable gamertag.
 - `stop` halts execution, but `isstopped` still reports threads as running and volatile registers stay unreadable. Only threads stopped by a debug event appear as stopped.
 
 ## Development

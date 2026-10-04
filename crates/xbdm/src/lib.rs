@@ -5,17 +5,22 @@
 //! answers discovery broadcasts on UDP port 730.
 
 pub mod client;
+pub mod content;
 pub mod debug;
+pub mod display;
 pub mod discovery;
 pub mod error;
+pub mod memory;
 pub mod path;
 pub mod response;
 pub mod screenshot;
+pub mod shell;
 pub mod title;
 pub mod transfer;
 
 pub use client::{Client, DirEntry, FreeSpace, Module};
 pub use screenshot::Screenshot;
+pub use memory::Pattern;
 pub use debug::{Context, Notification, Notifications, Region, Section, ThreadInfo, Watch};
 pub use discovery::{discover, resolve, Console};
 pub use error::{Error, Result};

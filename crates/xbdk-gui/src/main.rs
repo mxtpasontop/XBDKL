@@ -1,11 +1,12 @@
 //! `xbdk-gui`: Xbox 360 Neighborhood for Linux, graphical edition.
 
 mod app;
+mod settings;
 mod worker;
 
 use eframe::egui;
 
-const USAGE: &str = "usage: xbdk-gui [--tab console|files|screen|debug]
+const USAGE: &str = "usage: xbdk-gui [--tab console|games|files|screen|debug|terminal]
 The console is taken from XBDK_CONSOLE, or found on the network.";
 
 fn main() -> eframe::Result {
